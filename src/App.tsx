@@ -1,12 +1,16 @@
 import { useState, useEffect, useRef } from 'react'
 import { joinRoom } from 'trystero/supabase'
 import type { Room } from 'trystero'
+import { createClient, type RealtimeChannel } from '@supabase/supabase-js'
 import ConnectionTest from './components/ConnectionTest'
 import './App.css'
 
 // Supabase 설정 (환경 변수에서 가져오기)
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+// Supabase Client 생성
+const supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 // ICE 서버 설정 (Google 공개 STUN 서버)
 const TURN_CONFIG = {
@@ -30,6 +34,7 @@ function App() {
   // Room과 스트림 참조 저장
   const roomRef = useRef<Room | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
+  const presenceChannelRef = useRef<RealtimeChannel | null>(null)
 
   useEffect(() => {
     // 로컬 비디오 스트림 초기화
@@ -55,6 +60,11 @@ function App() {
       if (roomRef.current) {
         roomRef.current.leave()
       }
+      if (presenceChannelRef.current) {
+        presenceChannelRef.current.untrack()
+        supabaseClient.removeChannel(presenceChannelRef.current)
+        presenceChannelRef.current = null
+      }
     }
   }, [])
 
@@ -65,8 +75,68 @@ function App() {
     }
 
     try {
+      setStatus('방 참여자 수 확인 중...')
+      
+      // 1. Presence 채널로 현재 참여자 수 확인
+      const presenceChannel = supabaseClient.channel(`room-presence:${roomId}`)
+      presenceChannelRef.current = presenceChannel
+
+      // Presence 구독 및 상태 확인
+      const checkParticipantCount = (): Promise<number> => {
+        return new Promise((resolve, reject) => {
+          let resolved = false
+          
+          presenceChannel
+            .on('presence', { event: 'sync' }, () => {
+              if (!resolved) {
+                resolved = true
+                const state = presenceChannel.presenceState()
+                const participantCount = Object.keys(state).length
+                resolve(participantCount)
+              }
+            })
+            .subscribe(async (status) => {
+              if (status === 'SUBSCRIBED') {
+                // 구독 완료 후 약간의 지연을 두고 상태 확인
+                // sync 이벤트가 발생하지 않을 경우를 대비
+                setTimeout(() => {
+                  if (!resolved) {
+                    resolved = true
+                    const state = presenceChannel.presenceState()
+                    const participantCount = Object.keys(state).length
+                    resolve(participantCount)
+                  }
+                }, 100)
+              } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                if (!resolved) {
+                  resolved = true
+                  reject(new Error('Presence 채널 구독 실패'))
+                }
+              }
+            })
+        })
+      }
+
+      // 참여자 수 확인
+      const participantCount = await checkParticipantCount()
+
+      // 2명 이상이면 참여 거부
+      if (participantCount >= 2) {
+        setStatus(`방이 가득 찼습니다. (현재 ${participantCount}명 참여 중)`)
+        supabaseClient.removeChannel(presenceChannel)
+        presenceChannelRef.current = null
+        return
+      }
+
+      // 2명 미만이면 참여 허용
       setStatus('방에 연결 중...')
       
+      // Presence에 자신의 정보 추가
+      await presenceChannel.track({
+        userId: `user-${Date.now()}`,
+        joinedAt: new Date().toISOString()
+      })
+
       // Trystero Supabase 전략을 사용하여 방에 참여
       // appId는 Supabase URL로 사용됨 (내부적으로 createClient 호출 시)
       const room = joinRoom(
@@ -134,6 +204,13 @@ function App() {
 
   const disconnect = async () => {
     try {
+      // Presence에서 자신의 정보 제거
+      if (presenceChannelRef.current) {
+        await presenceChannelRef.current.untrack()
+        supabaseClient.removeChannel(presenceChannelRef.current)
+        presenceChannelRef.current = null
+      }
+
       // Room에서 나가기
       if (roomRef.current) {
         await roomRef.current.leave()

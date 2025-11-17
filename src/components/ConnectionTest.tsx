@@ -1,11 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import { joinRoom } from 'trystero/supabase'
 import type { Room } from 'trystero'
+import { createClient, type RealtimeChannel } from '@supabase/supabase-js'
 import './ConnectionTest.css'
 
 // Supabase 설정
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+// Supabase Client 생성
+const supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 // ICE 서버 설정 (Google 공개 STUN 서버)
 const TURN_CONFIG = {
@@ -48,6 +52,7 @@ export default function ConnectionTest() {
   const remoteAnalyserRef = useRef<AnalyserNode | null>(null)
   const animationFrameRef = useRef<number>()
   const latencyIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const presenceChannelRef = useRef<RealtimeChannel | null>(null)
 
   const addTestResult = (test: string, status: TestResult['status'], message: string) => {
     const result: TestResult = {
@@ -78,6 +83,13 @@ export default function ConnectionTest() {
         audioContext.close().catch(() => {
           // 이미 닫힌 경우 무시
         })
+      }
+      
+      // Presence 채널 정리
+      if (presenceChannelRef.current) {
+        presenceChannelRef.current.untrack()
+        supabaseClient.removeChannel(presenceChannelRef.current)
+        presenceChannelRef.current = null
       }
       
       // Room 정리
@@ -237,7 +249,66 @@ export default function ConnectionTest() {
       // 로컬 오디오 분석 초기화
       initAudioAnalysis(stream, true)
 
-      // 2. Trystero 방 참여 테스트
+      // 2. 방 참여자 수 확인
+      addTestResult('방 참여자 수 확인', 'running', '현재 참여자 수를 확인 중...')
+      
+      const presenceChannel = supabaseClient.channel(`room-presence:${roomId}`)
+      presenceChannelRef.current = presenceChannel
+
+      // Presence 구독 및 상태 확인
+      const checkParticipantCount = (): Promise<number> => {
+        return new Promise((resolve, reject) => {
+          let resolved = false
+          
+          presenceChannel
+            .on('presence', { event: 'sync' }, () => {
+              if (!resolved) {
+                resolved = true
+                const state = presenceChannel.presenceState()
+                const participantCount = Object.keys(state).length
+                resolve(participantCount)
+              }
+            })
+            .subscribe(async (status) => {
+              if (status === 'SUBSCRIBED') {
+                setTimeout(() => {
+                  if (!resolved) {
+                    resolved = true
+                    const state = presenceChannel.presenceState()
+                    const participantCount = Object.keys(state).length
+                    resolve(participantCount)
+                  }
+                }, 100)
+              } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                if (!resolved) {
+                  resolved = true
+                  reject(new Error('Presence 채널 구독 실패'))
+                }
+              }
+            })
+        })
+      }
+
+      // 참여자 수 확인
+      const participantCount = await checkParticipantCount()
+      addTestResult('방 참여자 수 확인', 'success', `현재 참여자: ${participantCount}명`)
+
+      // 2명 이상이면 참여 거부
+      if (participantCount >= 2) {
+        addTestResult('방 참여', 'failed', `방이 가득 찼습니다. (현재 ${participantCount}명 참여 중)`)
+        supabaseClient.removeChannel(presenceChannel)
+        presenceChannelRef.current = null
+        setIsTestRunning(false)
+        return
+      }
+
+      // Presence에 자신의 정보 추가
+      await presenceChannel.track({
+        userId: `user-${Date.now()}`,
+        joinedAt: new Date().toISOString()
+      })
+
+      // 3. Trystero 방 참여 테스트
       addTestResult('Trystero 연결', 'running', 'Supabase를 통해 방에 참여 중...')
       
       const room = joinRoom(
@@ -377,6 +448,13 @@ export default function ConnectionTest() {
       if (audioContext && audioContext.state !== 'closed') {
         audioContextRef.current = null // 먼저 참조 제거
         await audioContext.close()
+      }
+
+      // Presence에서 자신의 정보 제거
+      if (presenceChannelRef.current) {
+        await presenceChannelRef.current.untrack()
+        supabaseClient.removeChannel(presenceChannelRef.current)
+        presenceChannelRef.current = null
       }
 
       // Room에서 나가기
